@@ -145,12 +145,49 @@ async function handleApiRequest(request, pathname) {
 	}
 }
 
+// --- Cookie Helper ---
+function extractCookies(response) {
+	const pairs = [];
+	if (response.headers.getSetCookie) {
+		const setCookies = response.headers.getSetCookie();
+		for (const cookie of setCookies) {
+			const nameValue = cookie.split(';')[0];
+			if (nameValue && nameValue.includes('=')) pairs.push(nameValue);
+		}
+	} else {
+		const cookieHeader = response.headers.get('set-cookie');
+		if (cookieHeader) {
+			const parts = cookieHeader.split(/,\s*(?=[a-zA-Z0-9_-]+\s*=)/);
+			for (const part of parts) {
+				const nameValue = part.split(';')[0];
+				if (nameValue && nameValue.includes('=')) pairs.push(nameValue);
+			}
+		}
+	}
+	return pairs;
+}
+
+function mergeCookies(existing, newPairs) {
+	// Build a map of name->value, new cookies override old ones
+	const map = new Map();
+	for (const pair of existing) {
+		const eqIdx = pair.indexOf('=');
+		if (eqIdx > 0) map.set(pair.substring(0, eqIdx).trim(), pair);
+	}
+	for (const pair of newPairs) {
+		const eqIdx = pair.indexOf('=');
+		if (eqIdx > 0) map.set(pair.substring(0, eqIdx).trim(), pair);
+	}
+	return Array.from(map.values());
+}
+
 // --- Core Checkin Logic (Wrapped to collect logs) ---
 async function performCheckinWithLogs() {
 	const maxRetries = 3;
 	const retryDelay = 5000;
 	let capturedLogs = [];
 	const log = (msg) => { console.log(msg); capturedLogs.push(msg); };
+	const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36';
 
 	for (let attempt = 1; attempt <= maxRetries; attempt++) {
 		try {
@@ -166,7 +203,7 @@ async function performCheckinWithLogs() {
 				method: 'POST',
 				headers: {
 					'Content-Type': 'application/json',
-					'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36',
+					'User-Agent': UA,
 					'Accept': 'application/json, text/plain, */*',
 					'Origin': domain,
 					'Referer': `${domain}/auth/login`,
@@ -185,26 +222,60 @@ async function performCheckinWithLogs() {
 			log("✓ 登录验证通过");
 
 			// Extract Cookies
-			let cookies = "";
-			if (loginResponse.headers.getSetCookie) {
-				const setCookies = loginResponse.headers.getSetCookie();
-				cookies = setCookies.map(cookie => cookie.split(';')[0]).join('; ');
-			} else {
-				const cookieHeader = loginResponse.headers.get('set-cookie');
-				if (cookieHeader) cookies = cookieHeader.split(/,\s*(?=[a-zA-Z0-9_-]+\s*=)/).map(cookie => cookie.split(';')[0]).join('; ');
+			let cookiePairs = extractCookies(loginResponse);
+			if (cookiePairs.length === 0) throw new Error("未能获取到有效的 Cookie");
+			const cookieNames = cookiePairs.map(p => p.split('=')[0]);
+			log(`获取到 ${cookiePairs.length} 个 Cookie: ${cookieNames.join(', ')}`);
+
+			// Session verification - wait for session to propagate on the server
+			log("验证会话状态...");
+			const maxSessionChecks = 5;
+			let sessionVerified = false;
+			for (let sc = 1; sc <= maxSessionChecks; sc++) {
+				await new Promise(resolve => setTimeout(resolve, sc === 1 ? 1000 : 2000));
+				const verifyResponse = await fetch(`${domain}/user`, {
+					method: 'GET',
+					headers: {
+						'Cookie': cookiePairs.join('; '),
+						'User-Agent': UA,
+						'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+						'Referer': `${domain}/auth/login`,
+					},
+					redirect: 'manual',
+				});
+
+				// Merge any new cookies from the verify response
+				const verifyCookies = extractCookies(verifyResponse);
+				if (verifyCookies.length > 0) {
+					cookiePairs = mergeCookies(cookiePairs, verifyCookies);
+				}
+
+				if (verifyResponse.status === 200 || verifyResponse.status === 304) {
+					log(`✓ 会话验证通过 (第 ${sc} 次检查)`);
+					sessionVerified = true;
+					break;
+				} else if (verifyResponse.status >= 300 && verifyResponse.status < 400) {
+					if (sc < maxSessionChecks) {
+						log(`会话尚未就绪 (HTTP ${verifyResponse.status})，等待 2s 后重试验证... (${sc}/${maxSessionChecks})`);
+					}
+				} else {
+					log(`会话验证异常 (HTTP ${verifyResponse.status})，继续尝试签到...`);
+					sessionVerified = true;
+					break;
+				}
 			}
 
-			if (!cookies) throw new Error("未能获取到有效的 Cookie");
-
-			await new Promise(resolve => setTimeout(resolve, 1000));
+			if (!sessionVerified) {
+				throw new Error("会话验证失败: 登录成功但 Session 始终未就绪，可能是服务端问题");
+			}
 
 			// Checkin
 			log("正在发送签到请求...");
 			const checkinResponse = await fetch(`${domain}/user/checkin`, {
 				method: 'POST',
 				headers: {
-					'Cookie': cookies,
-					'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36',
+					'Cookie': cookiePairs.join('; '),
+					'User-Agent': UA,
 					'Accept': 'application/json, text/plain, */*',
 					'Content-Type': 'application/json',
 					'Origin': domain,
@@ -219,7 +290,7 @@ async function performCheckinWithLogs() {
 			// 检测重定向（通常意味着 session 失效）
 			if (checkinResponse.status >= 300 && checkinResponse.status < 400) {
 				const location = checkinResponse.headers.get('location') || '未知';
-				throw new Error(`签到请求被重定向 (HTTP ${checkinResponse.status}) -> ${location}，可能 Cookie/Session 失效`);
+				throw new Error(`签到请求被重定向 (HTTP ${checkinResponse.status}) -> ${location}，Cookie/Session 失效`);
 			}
 
 			if (!checkinResponse.ok) {
